@@ -19,7 +19,7 @@ using TensorNetworkQuantumSimulator
 const TNQS = TensorNetworkQuantumSimulator
 using TensorNetworkQuantumSimulator:
     named_hexagonal_lattice_graph, named_grid, vertices, edges, src, dst, neighbors,
-    fermion_tensornetworkstate, norm_sqr, expect,
+    fermion_tensornetworkstate, norm_sqr, expect, symmetric_gauge,
     BeliefPropagationCache, update, apply_gates, network
 using TensorNetworkQuantumSimulator.ITensorKit:
     Index, ITensor, ITensorMap, fermion_siteind, number_op, hopping_gate, contract, dag, noprime, scalar
@@ -296,6 +296,12 @@ end
         mb_ex = [real(expect(ψ, ("N", v); alg = "exact")) for v in vs]
         @test mb_ex ≈ real.(diag(C)) atol = 1e-9
 
+        # The graded symmetric (Vidal) gauge preserves the physical state: gauged ⟨N⟩ and the
+        # norm² sign are unchanged (a wrong duality/sign would break this).
+        ψg = symmetric_gauge(ψ)
+        @test [real(expect(ψg, ("N", v); alg = "exact")) for v in vs] ≈ mb_ex atol = 1e-9
+        @test real(norm_sqr(ψg; alg = "exact")) ≈ 1 atol = 1e-9
+
         # boundary MPS: well-defined norm (+1), converges to exact and improves with bond dimension
         occ_bmps(χ) = [real(expect(ψ, ("N", v); alg = "boundarymps", mps_bond_dimension = χ, gauge_state = false)) for v in vs]
         err(χ) = maximum(abs.(occ_bmps(χ) .- mb_ex))
@@ -303,11 +309,13 @@ end
         @test err(16) < 1e-6            # converged to exact at χ = 16
         @test err(16) < err(4)          # larger bond dimension is strictly better
 
-        # The default gauge_state=true must also work for a graded state: symmetric_gauge! is not
-        # graded-ready, so gauging is skipped (not errored) and the ungauged boundary MPS still
-        # converges to exact.
-        occ_def = [real(expect(ψ, ("N", v); alg = "boundarymps", mps_bond_dimension = 16)) for v in vs]
-        @test maximum(abs.(occ_def .- mb_ex)) < 1e-6
+        # The default gauge_state=true path applies the graded symmetric gauge as an accuracy
+        # preconditioner. It must converge to exact and, at a fixed moderate bond dimension, be at
+        # least as accurate as the ungauged boundary MPS.
+        occ_gauged(χ) = [real(expect(ψ, ("N", v); alg = "boundarymps", mps_bond_dimension = χ, gauge_state = true)) for v in vs]
+        errg(χ) = maximum(abs.(occ_gauged(χ) .- mb_ex))
+        @test errg(16) < 1e-6              # gauged converges to exact (also the gauge_state=true default)
+        @test errg(8) <= err(8) + 1e-10    # gauged at least as accurate as ungauged at fixed χ
     end
 
 end

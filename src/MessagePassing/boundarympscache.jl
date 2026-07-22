@@ -165,12 +165,9 @@ function BoundaryMPSCache(
     group_sorting_function = partition_by == "row" ? v -> last(v) : v -> first(v)
 
     if gauge_state && (tn isa TensorNetworkState)
-        # `symmetric_gauge!` is not graded (fermionic) ready — every bond relabel there assumes a
-        # self-dual space. Gauging is only an accuracy preconditioner (the boundary MPS still
-        # converges to the exact contraction as `mps_bond_dimension` grows), so for a graded state
-        # we skip it rather than error, keeping the default `expect(alg="boundarymps")` usable.
-        # Graded `symmetric_gauge!` is future work.
-        _is_graded_network(tn) || (tn = gauge_and_scale(tn))
+        # Apply the symmetric (Vidal) gauge as an accuracy preconditioner. `symmetric_gauge!`
+        # handles both dense and graded (fermionic `Vect[fℤ₂]`) states, so this runs uniformly.
+        tn = gauge_and_scale(tn)
     end
     pseudo_edges = pseudo_planar_edges(tn; grouping_function)
 
