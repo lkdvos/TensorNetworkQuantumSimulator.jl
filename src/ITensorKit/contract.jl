@@ -34,6 +34,19 @@ function contract(
         sequence = nothing, alg = "optimal", kwargs...
     )::ITensorMap
     tensors = (t1, ts...)
+
+    # 0-leg tensors are scalars: they only rescale the result. Peel them off so a bare
+    # `ITensor(x)` (over the `CartesianSpace` unit) does not force a spacetype clash in `ncon`
+    # when multiplied against a graded network (e.g. the `ITensor(one(Bool))` accumulator seeds
+    # in `edge_scalar`/`path_contract`). Numerically identical to contracting them in.
+    if any(t -> numind(t) == 0, tensors)
+        nonscalars = filter(t -> numind(t) > 0, tensors)
+        c = prod(scalar, filter(t -> numind(t) == 0, tensors))
+        isempty(nonscalars) && return unsafe_itensormap(fill!(zeros(typeof(c), one(spacetype(t1))), c), ())
+        length(nonscalars) == 1 && return c * only(nonscalars)
+        return c * contract(nonscalars...; sequence, alg, kwargs...)
+    end
+
     allinds = reduce(vcat, (collect(inds(t)) for t in tensors))
     nocc(i) = count(==(i), allinds)
     any(>(2) ∘ nocc, allinds) && throw(

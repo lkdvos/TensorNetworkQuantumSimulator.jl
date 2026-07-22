@@ -254,5 +254,61 @@ end
         @test mb_bp ≈ mb_ex atol = 1e-2       # BP approximate on loops but close at small θ
     end
 
+    @testset "(f) boundary-MPS contraction (graded product state)" begin
+        # A fermionic charge-density-wave product state on a grid, contracted with the boundary-MPS
+        # algorithm. For a product state the graded interpartition MPS is exact, so norm² = 1 and the
+        # occupations are recovered exactly.
+        g = named_grid((3, 3))
+        vs, occ = cdw_occupations(g; parity_target = 0)
+        occd = Dict(vs[i] => occ[i] for i in eachindex(vs))
+        ψ0 = fermion_tensornetworkstate(v -> occd[v], g)
+        @test real(norm_sqr(ψ0; alg = "boundarymps", mps_bond_dimension = 16)) ≈ 1 atol = 1e-8
+        for v in vs
+            nb = real(expect(ψ0, ("N", v); alg = "boundarymps", mps_bond_dimension = 16, gauge_state = false))
+            @test nb ≈ occd[v] atol = 1e-8
+        end
+    end
+
+    @testset "(g) boundary-MPS contraction (graded entangled/evolved state)" begin
+        # One layer of hopping entangles the 3×3 charge-density-wave state (the ket virtual bonds
+        # now carry both fℤ₂ sectors). The graded boundary MPS goes through the doubled SVD zip-up,
+        # which mints correctly-sectored bonds, so alg="boundarymps" → alg="exact" as the bond
+        # dimension grows (norm² stays +1). Because the model is quadratic the untruncated evolved
+        # state is exact, so alg="exact" also matches the single-particle reference C.
+        g = named_grid((3, 3))
+        vs, occ = cdw_occupations(g; parity_target = 0)
+        occd = Dict(vs[i] => occ[i] for i in eachindex(vs))
+        vindex = Dict(v => i for (i, v) in enumerate(vs))
+        ψ = fermion_tensornetworkstate(v -> occd[v], g)
+        sind(v) = only(TNQS.siteinds(ψ, v))
+        C = ComplexF64.(diagm([occd[v] for v in vs]))
+        θ = 0.3
+        for e in [(src(x), dst(x)) for x in edges(g)]
+            u, w = e
+            gate = hopping_gate(sind(u), sind(w), θ)
+            upd, _, _ = TNQS.simple_update(gate, ITensor[ψ[u], ψ[w]];
+                envs = ITensor[], normalize_tensors = false, cutoff = 0.0, maxdim = 4096)
+            ψ[u] = upd[1]; ψ[w] = upd[2]
+            sp_gate!(C, vindex[u], vindex[w], θ)
+        end
+
+        # untruncated evolution is exact ⇒ alg="exact" matches the free-fermion reference
+        mb_ex = [real(expect(ψ, ("N", v); alg = "exact")) for v in vs]
+        @test mb_ex ≈ real.(diag(C)) atol = 1e-9
+
+        # boundary MPS: well-defined norm (+1), converges to exact and improves with bond dimension
+        occ_bmps(χ) = [real(expect(ψ, ("N", v); alg = "boundarymps", mps_bond_dimension = χ, gauge_state = false)) for v in vs]
+        err(χ) = maximum(abs.(occ_bmps(χ) .- mb_ex))
+        @test real(norm_sqr(ψ; alg = "boundarymps", mps_bond_dimension = 16)) ≈ 1 atol = 1e-8
+        @test err(16) < 1e-6            # converged to exact at χ = 16
+        @test err(16) < err(4)          # larger bond dimension is strictly better
+
+        # The default gauge_state=true must also work for a graded state: symmetric_gauge! is not
+        # graded-ready, so gauging is skipped (not errored) and the ungauged boundary MPS still
+        # converges to exact.
+        occ_def = [real(expect(ψ, ("N", v); alg = "boundarymps", mps_bond_dimension = 16)) for v in vs]
+        @test maximum(abs.(occ_def .- mb_ex)) < 1e-6
+    end
+
 end
 end

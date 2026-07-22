@@ -28,7 +28,7 @@ include("opcatalogue.jl")
 include("fermions.jl")
 
 # Re-export the TensorKit accessors that downstream code uses directly.
-export scalartype, storagetype, spacetype, dim, space
+export scalartype, storagetype, spacetype, dim, space, fuse, dual
 
 
 end # module ITensorKit
