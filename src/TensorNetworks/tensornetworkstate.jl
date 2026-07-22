@@ -57,7 +57,12 @@ function norm_factors(tns::TensorNetworkState, verts::Vector; op_strings::Functi
         if op_strings(v) == "ρ" || isempty(sinds)
             append!(factors, ITensor[tnv, tnv_dag])
         elseif op_strings(v) == "I"
-            tnv_dag = replaceinds(tnv_dag, prime.(sinds), sinds)
+            # Drop the prime on the bra's site legs so they contract with the ket's,
+            # keeping each leg's (possibly dual) space. For self-dual (dense) legs
+            # `dag` is a no-op and this is the identity relabel `prime.(sinds) => sinds`;
+            # for graded/fermionic legs the bra site must carry the *dual* space
+            # (`dag(sinds)`) to pair correctly with the non-dual ket leg.
+            tnv_dag = replaceinds(tnv_dag, dag.(prime.(sinds)), dag.(sinds))
             append!(factors, ITensor[tnv, tnv_dag])
         else
             optensor = adapt_like(tnv, op(op_strings(v), only(sinds)))

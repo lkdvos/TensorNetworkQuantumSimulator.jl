@@ -63,7 +63,8 @@ using .ITensorKit: ITensorKit,
     combiner, combinedind, dense, denseblocks, hasqns,
     storagetype, scalar, array,
     map_diag, map_diag!, factorize_svd,
-    op, state, apply, disable_warn_order, contraction_sequence
+    op, state, apply, disable_warn_order, contraction_sequence,
+    fermion_space, fermion_siteind, number_op, hopping_gate, parity_space, fermion_site_tensor
 
 # Functions that TNQS adds methods to (extends) must be `import`ed, not `using`d.
 import .ITensorKit: uniqueinds, datatype, scalartype, contract
