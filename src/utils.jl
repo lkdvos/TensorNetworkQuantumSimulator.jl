@@ -18,8 +18,19 @@ end
 function pseudo_sqrt_inv_sqrt(M::ITensor; cutoff = 10 * eps(real(scalartype(M))))
     @assert length(inds(M)) == 2
     Q, D, Qdag = eigendecomp(M, inds(M)[1], inds(M)[2]; ishermitian = true)
-    D_sqrt = map_diag(x -> iszero(x) || abs(x) < cutoff ? 0 : sqrt(x), D)
-    D_inv_sqrt = map_diag(x -> iszero(x) || abs(x) < cutoff ? 0 : inv(sqrt(x)), D)
+    # A fermionic (graded) environment is Hermitian but generally *indefinite*: odd-parity
+    # sectors carry a sign, so `D` can have negative eigenvalues. Take the principal complex
+    # branch of the (inverse) square root so that `M_sqrt^2 == M` and `M_sqrt * M_inv_sqrt == I`
+    # hold exactly regardless of sign. Keyed on `hasqns` so the branch is type-stable: the dense
+    # (self-dual) backend keeps the previous real square root, while the graded backend goes
+    # uniformly complex (a positive-semidefinite `D` then just has vanishing imaginary parts).
+    if hasqns(M)
+        D_sqrt = map_diag(x -> iszero(x) || abs(x) < cutoff ? complex(zero(x)) : sqrt(complex(x)), D)
+        D_inv_sqrt = map_diag(x -> iszero(x) || abs(x) < cutoff ? complex(zero(x)) : inv(sqrt(complex(x))), D)
+    else
+        D_sqrt = map_diag(x -> iszero(x) || abs(x) < cutoff ? zero(x) : sqrt(x), D)
+        D_inv_sqrt = map_diag(x -> iszero(x) || abs(x) < cutoff ? zero(x) : inv(sqrt(x)), D)
+    end
     M_sqrt = Q * D_sqrt * Qdag
     M_inv_sqrt = Q * D_inv_sqrt * Qdag
     return M_sqrt, M_inv_sqrt

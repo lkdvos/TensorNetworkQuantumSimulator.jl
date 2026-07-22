@@ -19,7 +19,8 @@ using TensorNetworkQuantumSimulator
 const TNQS = TensorNetworkQuantumSimulator
 using TensorNetworkQuantumSimulator:
     named_hexagonal_lattice_graph, named_grid, vertices, edges, src, dst, neighbors,
-    fermion_tensornetworkstate, norm_sqr, expect
+    fermion_tensornetworkstate, norm_sqr, expect,
+    BeliefPropagationCache, update, apply_gates, network
 using TensorNetworkQuantumSimulator.ITensorKit:
     Index, ITensor, ITensorMap, fermion_siteind, number_op, hopping_gate, contract, dag, noprime, scalar
 using Test: @testset, @test
@@ -135,6 +136,37 @@ function pipeline_quench(g, occf, edgelist; nsteps, θ)
     return mb, real.(diag(C)), real(norm_sqr(ψ; alg = "exact"))
 end
 
+# BP quench: evolve with `apply_gates` through a `BeliefPropagationCache` (simple update using
+# belief-propagation environments), then measure with alg="bp" and, on the evolved network,
+# alg="exact". Because there is no truncation the evolved state stays exact, so alg="exact" must
+# match the free-fermion reference; alg="bp" additionally tests the belief-propagation contraction.
+# Returns (bp densities, exact densities, reference densities, bp norm²).
+function bp_quench(g, occf, edgelist; nsteps, θ)
+    vs = collect(vertices(g))
+    vindex = Dict(v => i for (i, v) in enumerate(vs))
+    ψ = fermion_tensornetworkstate(occf, g)
+    sind(v) = only(TNQS.siteinds(ψ, v))
+    C = ComplexF64.(diagm([occf(v) for v in vs]))
+    gates = ITensor[]
+    gate_vs = Vector{eltype(vs)}[]
+    for _ in 1:nsteps, e in edgelist
+        u, v = e
+        push!(gates, hopping_gate(sind(u), sind(v), θ))
+        push!(gate_vs, [u, v])
+        sp_gate!(C, vindex[u], vindex[v], θ)
+    end
+    ψ_bpc = BeliefPropagationCache(ψ)
+    ψ_bpc = update(ψ_bpc; maxiter = 1)
+    ψ_bpc, _ = apply_gates(
+        gates, ψ_bpc; gate_vertices = gate_vs,
+        apply_kwargs = (; cutoff = 0.0, maxdim = 4096, normalize_tensors = false), update_cache = true,
+    )
+    ψev = network(ψ_bpc)
+    mb_bp = [real(expect(ψ_bpc, ("N", v); alg = "bp")) for v in vs]
+    mb_ex = [real(expect(ψev, ("N", v); alg = "exact")) for v in vs]
+    return mb_bp, mb_ex, real.(diag(C)), real(norm_sqr(ψ_bpc; alg = "bp"))
+end
+
 @testset "Fermions (free-fermion quench)" begin
 
     @testset "(a) two sites, one particle" begin
@@ -196,6 +228,30 @@ end
         mb, sp, nrm = pipeline_quench(gp, v -> occp[v], esp; nsteps = 5, θ = 0.4)
         @test nrm ≈ 1 atol = 1e-10
         @test mb ≈ sp atol = 1e-10
+    end
+
+    @testset "(e) belief propagation: simple update + BP environments" begin
+        # 1D chain (tree): BP is exact, so alg="bp" == alg="exact" == reference to machine precision.
+        gp = named_grid((4, 1))
+        vsp = collect(vertices(gp))
+        occp = Dict(vsp[i] => (isodd(i) ? 1 : 0) for i in eachindex(vsp))
+        esp = [(src(e), dst(e)) for e in edges(gp)]
+        mb_bp, mb_ex, sp, nrm_bp = bp_quench(gp, v -> occp[v], esp; nsteps = 5, θ = 0.4)
+        @test nrm_bp ≈ 1 atol = 1e-8          # well-defined BP norm (+1, even parity)
+        @test mb_ex ≈ sp atol = 1e-9          # BP-evolved state is exact (no truncation)
+        @test mb_bp ≈ mb_ex atol = 1e-9       # BP is exact on a tree
+
+        # Honeycomb patch (has loops): the untruncated state stays exact so alg="exact" matches the
+        # free-fermion reference; BP itself is approximate on loops but stays well-defined and, at a
+        # small Trotter angle, close to exact.
+        g = named_hexagonal_lattice_graph(1, 1)
+        vs, occ = cdw_occupations(g; parity_target = 0)
+        occd = Dict(vs[i] => occ[i] for i in eachindex(vs))
+        es = [(src(e), dst(e)) for e in edges(g)]
+        mb_bp, mb_ex, sp, nrm_bp = bp_quench(g, v -> occd[v], es; nsteps = 4, θ = 0.1)
+        @test nrm_bp ≈ 1 atol = 1e-6          # well-defined BP norm (+1), not the −1 fermionic sign
+        @test mb_ex ≈ sp atol = 1e-9          # evolution is exact
+        @test mb_bp ≈ mb_ex atol = 1e-2       # BP approximate on loops but close at small θ
     end
 
 end

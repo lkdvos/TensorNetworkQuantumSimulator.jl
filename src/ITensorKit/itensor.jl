@@ -155,6 +155,22 @@ function dag(t::ITensorMap)
 end
 
 """
+    transpose(t::ITensorMap)
+
+The transpose of `t`: like [`dag`](@ref) it dualizes every leg's `space` and swaps codomain
+and domain, but it does **not** conjugate the data. For real data `transpose == dag`; the two
+differ only in the complex phase, which matters when inverting a non-Hermitian (e.g. complex
+square-root) gauge factor. Implemented as a lazy TensorKit `transpose` of the data.
+"""
+function LinearAlgebra.transpose(t::ITensorMap)
+    N₁ = numout(t.data)
+    daginds = map(dag, t.inds)
+    # TensorKit `transpose` reorders legs to (domain..., codomain...) like `adjoint`, without conj
+    newinds = (daginds[(N₁ + 1):end]..., daginds[1:N₁]...)
+    return unsafe_itensormap(transpose(t.data), newinds)
+end
+
+"""
     replaceind(t::ITensorMap, old::Index, new::Index)
     replaceinds(t::ITensorMap, olds, news)
 

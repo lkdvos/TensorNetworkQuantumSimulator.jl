@@ -59,8 +59,13 @@ function simple_update(
         )
         err = spec.truncerr
         s_values = singular_values![]
-        Qᵥ₁ = contract([Qᵥ₁; dag.(inv_sqrt_envs_v1)])
-        Qᵥ₂ = contract([Qᵥ₂; dag.(inv_sqrt_envs_v2)])
+        # Un-gauge with the transpose (not the adjoint) of the inverse square root: the
+        # environment metric is Hermitian but, for fermions, indefinite, so `env_sqrt` is a
+        # non-Hermitian (complex) square root. Its true inverse composes with `env_sqrt` only via
+        # `transpose`, not `dag` (which would conjugate and flip the sign in negative sectors).
+        # For real/dense environments `transpose == dag`, so this leaves that path unchanged.
+        Qᵥ₁ = contract([Qᵥ₁; transpose.(inv_sqrt_envs_v1)])
+        Qᵥ₂ = contract([Qᵥ₂; transpose.(inv_sqrt_envs_v2)])
         updated_tensors = [Qᵥ₁ * Rᵥ₁, Qᵥ₂ * Rᵥ₂]
         if normalize_tensors
             s_values = normalize(s_values)
@@ -68,9 +73,10 @@ function simple_update(
     end
 
     if normalize_tensors
-        for ψᵥ in updated_tensors
-            rmul!(ITensors.data(ψᵥ), inv(norm(ψᵥ)))
-        end
+        # Rescale each updated tensor to unit norm using the ITensorMap-native scalar `/`
+        # (the old `rmul!(ITensors.data(ψᵥ), …)` reached into ITensor dense storage, which the
+        # TensorKit-backed `ITensorMap` does not provide).
+        updated_tensors = [ψᵥ / norm(ψᵥ) for ψᵥ in updated_tensors]
     end
 
     return noprime.(updated_tensors), s_values, err
