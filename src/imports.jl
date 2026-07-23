@@ -57,7 +57,7 @@ using ITensors: ITensors, Algorithm, @Algorithm_str, OpName, @OpName_str, SiteTy
 using .ITensorKit: ITensorKit,
     Index, ITensor, itensor, random_itensor, onehot, delta, directsum,
     inds, plev, dim, space, dag, prime, noprime, sim, setprime,
-    replaceind, replaceinds, swapind,
+    replaceind, replaceinds, swapind, permute, twist,
     commonind, commoninds, uniqueind, noncommonind, noncommoninds,
     unioninds, hascommoninds, hasind,
     combiner, combinedind, dense, denseblocks, hasqns,

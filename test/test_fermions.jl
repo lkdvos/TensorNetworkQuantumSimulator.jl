@@ -20,7 +20,8 @@ const TNQS = TensorNetworkQuantumSimulator
 using TensorNetworkQuantumSimulator:
     named_hexagonal_lattice_graph, named_grid, vertices, edges, src, dst, neighbors,
     fermion_tensornetworkstate, norm_sqr, expect, symmetric_gauge,
-    BeliefPropagationCache, update, apply_gates, network
+    BeliefPropagationCache, update, apply_gates, network,
+    reduced_density_matrix, norm_factors
 using TensorNetworkQuantumSimulator.ITensorKit:
     Index, ITensor, ITensorMap, fermion_siteind, number_op, hopping_gate, contract, dag, noprime, scalar
 using Test: @testset, @test
@@ -316,6 +317,58 @@ end
         errg(χ) = maximum(abs.(occ_gauged(χ) .- mb_ex))
         @test errg(16) < 1e-6              # gauged converges to exact (also the gauge_state=true default)
         @test errg(8) <= err(8) + 1e-10    # gauged at least as accurate as ungauged at fixed χ
+    end
+
+    @testset "(h) reduced density matrix (fermionic trace convention)" begin
+        # Guards the RDM path (`reduced_density_matrix` + `normalize_rdm`), which — unlike
+        # `expect` — normalizes ρ by its own trace. On a graded (fℤ₂) leg the physical trace is
+        # not the plain matrix trace: the ket legs must be `twist`ed before tracing (handled by
+        # `tr(::ITensorMap)`, cf. Canopy's `twist!(ρ, physical_ket_legs)`). This test checks the
+        # trace normalization and `tr(op·ρ)` agree with the known-good in-network `expect`,
+        # including the odd-parity sector.
+
+        # Build an entangled fermionic state: a 4-site CDW chain evolved by a layer of hopping.
+        g = named_grid((4, 1))
+        vs = collect(vertices(g))
+        occd = Dict(vs[i] => (isodd(i) ? 1 : 0) for i in eachindex(vs))
+        ψ = fermion_tensornetworkstate(v -> occd[v], g)
+        sind(v) = only(TNQS.siteinds(ψ, v))
+        es = [(src(e), dst(e)) for e in edges(g)]
+        for e in es
+            u, w = e
+            gate = hopping_gate(sind(u), sind(w), 0.37)
+            upd, _, _ = TNQS.simple_update(gate, ITensor[ψ[u], ψ[w]];
+                envs = ITensor[], normalize_tensors = false, cutoff = 0.0, maxdim = 4096)
+            ψ[u] = upd[1]; ψ[w] = upd[2]
+        end
+
+        # In-network reference ⟨op⟩ = ⟨ψ|op|ψ⟩/⟨ψ|ψ⟩ built the same way `expect` does: the op
+        # sites keep the primed bra legs ("ρ"), everything else contracts to the norm, and the
+        # (possibly multi-site) operator ITensorMap is appended to close the sandwich.
+        function ref_expect(op_itensor, opsites)
+            tensors = norm_factors(ψ, collect(vertices(ψ)); op_strings = w -> (w in opsites) ? "ρ" : "I")
+            push!(tensors, op_itensor)
+            num = scalar(contract(tensors))
+            den = real(norm_sqr(ψ; alg = "exact"))
+            return num / den
+        end
+
+        # (i) single-site diagonal: tr(ρ_v ∘ N)/tr(ρ_v) must reproduce the known-good expect(N).
+        # A wrong odd-sector twist in the trace would break the occupied sites.
+        for v in vs
+            ρv = reduced_density_matrix(ψ, [v]; alg = "exact")
+            nv = real(expect(ρv, number_op(sind(v))))
+            @test nv ≈ real(expect(ψ, ("N", v); alg = "exact")) atol = 1e-10
+        end
+
+        # (ii) two-site off-diagonal: tr(ρ_{uw} ∘ H)/tr(ρ_{uw}) with a hopping operator connecting
+        # the odd-odd block |01⟩↔|10⟩ — the sector where a fermionic trace-sign error shows up.
+        # Compared against the in-network sandwich for the *same* operator.
+        for (u, w) in es
+            ρ2 = reduced_density_matrix(ψ, [u, w]; alg = "exact")
+            H = hopping_gate(sind(u), sind(w), 0.5)   # arbitrary probe operator (parity-even, off-diagonal)
+            @test expect(ρ2, H) ≈ ref_expect(H, (u, w)) atol = 1e-10
+        end
     end
 
 end

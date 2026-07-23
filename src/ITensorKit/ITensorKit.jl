@@ -7,6 +7,7 @@ using TensorKit
 using TensorOperations
 using VectorInterface
 using MatrixAlgebraKit
+using MatrixAlgebraKit: diagview
 using Adapt
 using OMEinsumContractionOrders: OMEinsumContractionOrders, optimize_code, EinCode, NestedEinsum, TreeSA, GreedyMethod, SABipartite, Treewidth, ExactTreewidth, HyperND
 using ITensors: ITensors, Algorithm, @Algorithm_str
@@ -28,7 +29,7 @@ include("opcatalogue.jl")
 include("fermions.jl")
 
 # Re-export the TensorKit accessors that downstream code uses directly.
-export scalartype, storagetype, spacetype, dim, space, fuse, dual
+export scalartype, storagetype, spacetype, dim, space, fuse, dual, permute, twist
 
 
 end # module ITensorKit

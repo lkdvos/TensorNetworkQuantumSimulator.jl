@@ -1,11 +1,28 @@
-function normalize_rdm(ρ::ITensor)
-    dtype = datatype(ρ)
-    tr_ρ = copy(ρ)
-    for i in inds(ρ; plev = 0)
-        tr_ρ *= adapt(dtype)(delta(i, prime(i)))
-    end
-    return ρ / scalar(tr_ρ)
+# Assemble an RDM into its canonical form: the ket legs (prime level 0) of the requested `verts`
+# form the codomain in `verts` order, their bra partners (`dag(prime(·))`) the domain in the same
+# order, giving a `W ← W` endomorphism. The fermionic `twist` is then baked onto the physical ket
+# legs (cf. Canopy's `twist!(ρ, physical_ket_legs)`), so afterwards a *plain* trace `tr(ρ)` — and
+# `tr(ρ ∘ O)` — are the correct physical (twisted) quantities with no further sign handling. On a
+# self-dual dense leg the twist is the identity, so this leaves the dense RDM unchanged.
+function order_rdm(ρ::ITensor, state, verts)
+    ket = reduce(vcat, [collect(siteinds(state, v)) for v in verts])
+    return order_rdm(ρ, ket)
 end
+
+# Self-inferring variant: the ket legs are `ρ`'s prime-level-0 legs (first-appearance order) and the
+# bra legs their `dag(prime(·))` partners. Same canonical twisted layout as the `verts` form; used
+# where the requested sites are implicit (e.g. the single-site RDMs built during sampling).
+order_rdm(ρ::ITensor) = order_rdm(ρ, collect(inds(ρ; plev = 0)))
+
+function order_rdm(ρ::ITensor, ket::AbstractVector{<:Index})
+    isempty(ket) && return ρ
+    bra = dag.(prime.(ket))
+    return twist(permute(ρ, ket, bra), ket)
+end
+
+# Trace-normalize an RDM by its (plain) trace. `ρ` is expected to be an `order_rdm` output, i.e.
+# already the twisted density matrix, so no twist is applied here.
+normalize_rdm(ρ::ITensor) = ρ / tr(ρ)
 
 """
     reduced_density_matrix(ψ, verts; alg = nothing, kwargs...)
@@ -42,6 +59,7 @@ function reduced_density_matrix(
     ρ_tensors = norm_factors(ψ, collect(vertices(ψ)); op_strings = op_string_f)
     seq = contraction_sequence(ρ_tensors; contraction_sequence_kwargs...)
     ρ = contract(ρ_tensors; sequence = seq)
+    ρ = order_rdm(ρ, ψ, verts)
     if normalize
         ρ = normalize_rdm(ρ)
     end
@@ -65,6 +83,7 @@ function reduced_density_matrix(
     append!(ρ_tensors, incoming_ms)
     seq = contraction_sequence(ρ_tensors; alg = "optimal")
     ρ = contract(ρ_tensors; sequence = seq)
+    ρ = order_rdm(ρ, network(cache), vs)
 
     if normalize
         ρ = normalize_rdm(ρ)
@@ -82,6 +101,7 @@ function reduced_density_matrix(
 
     op_string_f = v -> v ∈ vs ? "ρ" : "I"
     ρ, _ = path_contract(cache, vs, op_string_f; bmps_messages_up_to_date)
+    ρ = order_rdm(ρ, network(cache), vs)
 
     if normalize
         ρ = normalize_rdm(ρ)

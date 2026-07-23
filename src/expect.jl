@@ -56,6 +56,17 @@ function expect(ψ::Union{TensorNetworkState, BeliefPropagationCache, BoundaryMP
     return expect(Algorithm(alg), ψ, observable; kwargs...)
 end
 
+"""
+    expect(ρ::ITensor, O::ITensor) -> Number
+
+Expectation value `tr(ρ ∘ O) / tr(ρ)` of the operator `O` in the state described by the
+reduced density matrix `ρ` (as returned by [`reduced_density_matrix`](@ref), in its canonical
+ket-codomain / bra-domain layout). `O` is an operator `ITensor` on the same sites (e.g. from
+`op`, `number_op`); `∘` composes it with `ρ` as endomorphisms and `tr` carries the fermionic
+twist, so the result is correct on graded (fermionic) site legs as well as dense ones.
+"""
+expect(ρ::ITensor, O::ITensor) = tr(ρ ∘ O) / tr(ρ)
+
 function expect(
         alg::Algorithm"bp",
         cache::BeliefPropagationCache,
