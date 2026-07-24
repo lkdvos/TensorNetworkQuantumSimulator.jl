@@ -57,13 +57,14 @@ using ITensors: ITensors, Algorithm, @Algorithm_str, OpName, @OpName_str, SiteTy
 using .ITensorKit: ITensorKit,
     Index, ITensor, itensor, random_itensor, onehot, delta, directsum,
     inds, plev, dim, space, dag, prime, noprime, sim, setprime,
-    replaceind, replaceinds, swapind,
+    replaceind, replaceinds, swapind, permute, twist,
     commonind, commoninds, uniqueind, noncommonind, noncommoninds,
     unioninds, hascommoninds, hasind,
     combiner, combinedind, dense, denseblocks, hasqns,
     storagetype, scalar, array,
     map_diag, map_diag!, factorize_svd,
-    op, state, apply, disable_warn_order, contraction_sequence
+    op, state, apply, disable_warn_order, contraction_sequence,
+    fermion_space, fermion_siteind, number_op, hopping_gate, parity_space, fermion_site_tensor
 
 # Functions that TNQS adds methods to (extends) must be `import`ed, not `using`d.
 import .ITensorKit: uniqueinds, datatype, scalartype, contract

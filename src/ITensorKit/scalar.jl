@@ -30,14 +30,40 @@ end
 """
     diag(t::ITensorMap)
 
-The diagonal of a 2-leg tensor as a vector (e.g. sampling probabilities from a
-density-matrix tensor).
+The diagonal populations of a density-matrix-like tensor: the ket legs (prime level 0) are paired
+with their bra partners (higher prime level, matched by `id`) and repartitioned into an endomorphism
+`W ← W` (ket = codomain, matching bra = domain), exactly as in [`tr`](@ref). The diagonal is read
+per-sector via TensorKit's `diagview` — no dense `convert(Array, …)`, so the grading is kept intact
+(no categorical-property warning) — and the sector blocks are concatenated in canonical order (the
+same order the dense basis uses). For a fermionic reduced density matrix already carrying the
+physical-ket twist (see `order_rdm`) these are the physical populations `p_k = ⟨k|ρ|k⟩`, with
+`sum(diag(t)) == tr(t)`. Falls back to the dense diagonal when the legs do not split evenly into
+ket/bra pairs.
 """
-LinearAlgebra.diag(t::ITensorMap) = LinearAlgebra.diag(array(t))
+function LinearAlgebra.diag(t::ITensorMap)
+    ket = filter(i -> plev(i) == 0, t.inds)
+    bra = filter(i -> plev(i) != 0, t.inds)
+    (length(ket) == length(bra) && !isempty(ket)) || return LinearAlgebra.diag(array(t))
+    braord = map(k -> bra[findfirst(b -> _id(b) == _id(k), bra)], ket)
+    m = permute(t, ket, braord).data                   # endomorphism W ← W
+    return mapreduce(collect, vcat, values(diagview(m)))
+end
 
 """
     tr(t::ITensorMap)
 
-The trace of a 2-leg (square) tensor.
+The (regular) trace of a density-matrix-like tensor: the ket legs (prime level 0) are traced
+against their bra partners (higher prime level, matched by `id`). The legs are repartitioned
+into an endomorphism `W ← W` (ket = codomain, matching bra = domain) and traced with TensorKit's
+`tr`. This is a *plain* categorical trace with no twist of its own — a fermionic reduced density
+matrix must already carry the physical-ket-leg twist (see `order_rdm`). Falls back to the dense
+matrix trace when the legs do not split evenly into ket/bra pairs.
 """
-LinearAlgebra.tr(t::ITensorMap) = LinearAlgebra.tr(array(t))
+function LinearAlgebra.tr(t::ITensorMap)
+    ket = filter(i -> plev(i) == 0, t.inds)
+    bra = filter(i -> plev(i) != 0, t.inds)
+    (length(ket) == length(bra) && !isempty(ket)) || return LinearAlgebra.tr(array(t))
+    # pair each bra leg to its ket leg by identity, then repartition to `W ← W` and trace
+    braord = map(k -> bra[findfirst(b -> _id(b) == _id(k), bra)], ket)
+    return LinearAlgebra.tr(permute(t, ket, braord).data)
+end

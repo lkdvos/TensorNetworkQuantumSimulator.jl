@@ -28,8 +28,20 @@ function bp_edge_sequence(bmps_cache::BoundaryMPSCache)
     return QuotientEdge.(forest_cover_edge_sequence(quotient_graph(supergraph(bmps_cache))))
 end
 default_bp_maxiter(bmps_cache::BoundaryMPSCache) = is_tree(quotient_graph(supergraph(bmps_cache))) ? 1 : 5
+# Whether the network carries symmetry (graded/fermionic) sectors, keyed off the first tensor.
+function _is_graded_network(tn::AbstractTensorNetwork)
+    vs = collect(vertices(tn))
+    isempty(vs) && return false
+    return hasqns(tn[first(vs)])
+end
+
 function default_bmps_message_update_alg(tn)
-    if tn isa TensorNetworkState || tn isa BilinearForm || tn isa QuadraticForm
+    if tn isa TensorNetworkState
+        # Graded (fermionic) states go through the doubled SVD zip-up: the variational "fitting"
+        # sweep converges to a wrong fixed point from the sector-spanning random seed a graded MPS
+        # needs, whereas the zip-up is an optimal, deterministic doubled contraction.
+        return _is_graded_network(tn) ? "zipup" : "fitting"
+    elseif tn isa BilinearForm || tn isa QuadraticForm
         return "fitting"
     elseif tn isa TensorNetwork
         return "zipup"
@@ -153,6 +165,8 @@ function BoundaryMPSCache(
     group_sorting_function = partition_by == "row" ? v -> last(v) : v -> first(v)
 
     if gauge_state && (tn isa TensorNetworkState)
+        # Apply the symmetric (Vidal) gauge as an accuracy preconditioner. `symmetric_gauge!`
+        # handles both dense and graded (fermionic `Vect[fℤ₂]`) states, so this runs uniformly.
         tn = gauge_and_scale(tn)
     end
     pseudo_edges = pseudo_planar_edges(tn; grouping_function)
@@ -189,14 +203,36 @@ function set_interpartition_messages!(
                 setmessage!(bmps_cache, e, default_message(bmps_cache, e))
             end
         end
-        for i in 1:(length(es) - 1)
-            virt_dim = virtual_index_dimension(bmps_cache, es[i], es[i + 1])
-            ind = Index(virt_dim)
-            m1, m2 = message(bmps_cache, es[i]), message(bmps_cache, es[i + 1])
-            t = adapt_like(m1, dense(delta(ind)))
-            setmessage!(bmps_cache, es[i], m1 * t)
-            setmessage!(bmps_cache, es[i + 1], m2 * t)
+        if length(es) > 1 && hasqns(message(bmps_cache, first(es)))
+            set_graded_interpartition_messages!(bmps_cache, es)
+        else
+            for i in 1:(length(es) - 1)
+                virt_dim = virtual_index_dimension(bmps_cache, es[i], es[i + 1])
+                ind = Index(virt_dim)
+                m1, m2 = message(bmps_cache, es[i]), message(bmps_cache, es[i + 1])
+                t = adapt_like(m1, dense(delta(ind)))
+                setmessage!(bmps_cache, es[i], m1 * t)
+                setmessage!(bmps_cache, es[i + 1], m2 * t)
+            end
         end
+    end
+    return bmps_cache
+end
+
+# Graded (fermionic) interpartition-MPS initialization. Provides valid initial messages for the
+# doubled zip-up update (`default_bmps_message_update_alg`): a graded bond leg attached to the
+# even δ(ket, bra) message would force its odd sector to zero (charge conservation), so — unlike
+# the dense path, which mints a fixed-dimension `Index(virt_dim)` seed the `"fitting"` sweep then
+# fills — we simply stitch a trivial (even, dim-1) bond, `ind` on one side / `dag(ind)` on the
+# other so consecutive messages share a properly dualized bond. The graded boundary MPS goes
+# through the SVD zip-up, which mints its own correctly-sectored bonds directly from the doubled
+# contraction, so this seed's bond dimension is not the limiting factor.
+function set_graded_interpartition_messages!(bmps_cache::BoundaryMPSCache, es::Vector{<:NamedEdge})
+    for i in 1:(length(es) - 1)
+        m1, m2 = message(bmps_cache, es[i]), message(bmps_cache, es[i + 1])
+        ind = Index(oneunit(ITensorKit.spacetype(m1)))
+        setmessage!(bmps_cache, es[i], m1 * adapt_like(m1, delta(ind)))
+        setmessage!(bmps_cache, es[i + 1], m2 * adapt_like(m2, delta(dag(ind))))
     end
     return bmps_cache
 end
@@ -458,14 +494,25 @@ end
 # doubled ket/bra but only the ket layer is applied). When the source partition is a line endpoint
 # there is no previous interpartition, so `mps` comes back empty and the call reduces to compressing
 # the MPO chain.
-function _bmps_apply_inputs(bmps_cache::BoundaryMPSCache, pe::QuotientEdge; incoming_mps = nothing)
+#
+# When `doubled=true` (the graded `TensorNetworkState` message-update path) the boundary MPS lives
+# in the *doubled* (norm) network, so each MPO tensor is the ket⊗bra doubled site (`norm_factors`
+# identity-contracted over the physical leg) and each outgoing site leg is doubled `(l, prime(dag(l)))`;
+# the incoming cache messages are already doubled. The sampling path keeps the single (ket) layer and
+# doubles it manually, so it uses the default `doubled=false` (note its first-partition call also has
+# `incoming_mps === nothing`, so `doubled` must be an explicit flag, not inferred from `incoming_mps`).
+function _bmps_apply_inputs(bmps_cache::BoundaryMPSCache, pe::QuotientEdge; incoming_mps = nothing, doubled::Bool = false)
     net = network(bmps_cache)
     sorted_vs = sort(vertices(supergraph(bmps_cache), src(pe)))
     pos = Dict(v => i for (i, v) in enumerate(sorted_vs))
     b = length(sorted_vs)
 
-    # One MPO tensor per site (position) of the source partition.
-    mpo = ITensor[net[v] for v in sorted_vs]
+    # One MPO tensor per site (position) of the source partition; doubled = ket⊗bra (site trace).
+    mpo = if doubled
+        ITensor[contract(norm_factors(net, [v])) for v in sorted_vs]
+    else
+        ITensor[net[v] for v in sorted_vs]
+    end
 
     # Incoming MPS, keyed by the site each tensor attaches to.
     mps = Dictionary{Int, ITensor}()
@@ -477,10 +524,12 @@ function _bmps_apply_inputs(bmps_cache::BoundaryMPSCache, pe::QuotientEdge; inco
         end
     end
 
-    # Outgoing site legs: the network index on each edge of `pe`, keyed by the source site.
+    # Outgoing site legs: the network index on each edge of `pe`, keyed by the source site. For a
+    # doubled network each ket bond `l` is paired with its bra `prime(dag(l))`.
     right_inds = [Index[] for _ in 1:b]
     for e in sorted_edges(bmps_cache, pe)            # e = current_v => next_v
-        right_inds[pos[src(e)]] = collect(virtualinds(net, e))
+        ls = collect(virtualinds(net, e))
+        right_inds[pos[src(e)]] = doubled ? vcat(ls, prime.(dag.(ls))) : ls
     end
 
     return mpo, mps, right_inds
@@ -493,7 +542,9 @@ function update_message!(
         pe::QuotientEdge;
         maxdim::Integer = mps_bond_dimension(bmps_cache),
     )
-    mpo, mps, right_inds = _bmps_apply_inputs(bmps_cache, pe)
+    mpo, mps, right_inds = _bmps_apply_inputs(
+        bmps_cache, pe; doubled = network(bmps_cache) isa TensorNetworkState,
+    )
     out = generic_apply(
         mpo, mps, right_inds;
         cutoff = alg.kwargs.cutoff, maxdim, normalize = alg.kwargs.normalize,

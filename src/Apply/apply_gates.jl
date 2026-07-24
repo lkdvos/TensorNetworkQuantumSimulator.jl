@@ -111,13 +111,20 @@ function apply_gate!(
     if length(v⃗) == 2
         v1, v2 = v⃗
         e = NamedEdge(v1 => v2)
-        ind2 = commonind(s_values, first(updated_tensors))
-        δuv = dag(copy(s_values))
-        δuv = replaceind(δuv, ind2, ind2')
-        map_diag!(sign, δuv, δuv)
-        s_values = denseblocks(s_values) * denseblocks(δuv)
-        setmessage!(ψ_bpc, e, dag(s_values))
-        setmessage!(ψ_bpc, reverse(e), s_values)
+        # BP message convention (matches `default_message`): on the directed edge src→dst the
+        # message carries the ket bond leg `l` with its native duality on `tns[src]`, plus the
+        # bra partner `prime(dag(l))`, with `message(reverse(e)) == dag(message(e))`. After the
+        # gate SVD, `updated_tensors[1]` (at v1 = src of e) carries the new bond `l`, and the
+        # singular-value diagonal `s_values` already holds that same `l`; its other leg is the
+        # SVD-internal index. Relabelling that internal leg to `prime(dag(l))` lands `s_values`
+        # exactly on the canonical `{l, prime(dag(l))}` legs. The relabel is space-preserving
+        # (`space(prime(dag(l))) == space(internal)`), so it respects graded fermionic duality
+        # and reduces to the previous behaviour on the dense self-dual backend.
+        l = commonind(updated_tensors[1], updated_tensors[2])
+        internal = noncommonind(s_values, first(updated_tensors))
+        m = replaceind(s_values, internal, prime(dag(l)))
+        setmessage!(ψ_bpc, e, m)
+        setmessage!(ψ_bpc, reverse(e), dag(m))
     end
 
     for (i, v) in enumerate(v⃗)

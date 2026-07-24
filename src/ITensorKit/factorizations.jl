@@ -49,6 +49,42 @@ function _partition(A::ITensorMap, left_inds, right_inds)
     return permute(A.data, (pL, pR)), lefts, rights
 end
 
+"""
+    permute(t::ITensorMap, cod_inds, dom_inds) -> ITensorMap
+
+Repartition `t` into a `TensorMap` with codomain `cod_inds` and domain `dom_inds` (each a
+single `Index` or a collection). Together they must cover every leg of `t`. The underlying
+data is permuted accordingly (inserting the fermionic braiding signs), so a subsequent
+`tr`/`svd`/adjoint sees the intended codomain/domain split. Relabels nothing — the returned
+legs are exactly `(cod_inds..., dom_inds...)`.
+"""
+function TensorKit.permute(t::ITensorMap, cod_inds, dom_inds)
+    cods, doms = _astuple(cod_inds), _astuple(dom_inds)
+    length(cods) + length(doms) == numind(t) || throw(
+        ArgumentError("permute: codomain+domain legs ($(length(cods))+$(length(doms))) must cover all $(numind(t)) legs")
+    )
+    pC = map(i -> _findleg(t, i), cods)
+    pD = map(i -> _findleg(t, i), doms)
+    data = permute(t.data, (pC, pD))
+    return unsafe_itensormap(data, (cods..., doms...))
+end
+
+"""
+    twist(t::ITensorMap, is) -> ITensorMap
+
+Apply the fermionic `twist` to the leg(s) matching `is` (a single `Index` or a collection),
+returning a relabelled-identical `ITensorMap` whose data carries the per-sector parity sign on
+those legs. On a self-dual (dense) leg `twist` is the identity. Used to bake the physical-ket-leg
+twist into a reduced density matrix so a subsequent `tr` needs no twist of its own.
+"""
+function TensorKit.twist(t::ITensorMap, is)
+    data = t.data
+    for i in _astuple(is)
+        data = twist(data, _findleg(t, i))
+    end
+    return unsafe_itensormap(data, t.inds)
+end
+
 # Wrap a two-factor split `X * Y` (X: cod ← bond, Y: bond ← dom) sharing one fresh bond.
 function _wrap2(X, Y, lefts, rights)
     b = Index(space(X, numind(X)))               # X's bond leg (its last, in the domain)

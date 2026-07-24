@@ -140,6 +140,18 @@ identity so `t` no longer shares legs with its origin. Shares the underlying dat
 sim(t::ITensorMap) = unsafe_itensormap(t.data, map(sim, t.inds))
 
 """
+    ∘(A::ITensorMap, B::ITensorMap) -> ITensorMap
+
+Operator composition of two endomorphism-shaped tensors: the underlying `TensorMap`s are
+composed (`A.data * B.data`, requiring `domain(A.data) == codomain(B.data)`) and the result is
+re-wrapped with `A`'s index labels. Unlike `*` (which is `id`-matched network contraction and
+would fully contract two operators sharing all legs to a scalar), `∘` is structural matrix
+multiplication, inserting the fermionic braiding signs. Used to form `ρ ∘ O` for a
+density-matrix expectation value `tr(ρ ∘ O) / tr(ρ)`.
+"""
+Base.:∘(A::ITensorMap, B::ITensorMap) = unsafe_itensormap(A.data * B.data, A.inds)
+
+"""
     dag(t::ITensorMap)
 
 The dual of `t`: every leg's `space` is dualized and the data is conjugated, with
@@ -152,6 +164,22 @@ function dag(t::ITensorMap)
     # adjoint reorders legs to (domain..., codomain...); match that here
     newinds = (daginds[(N₁ + 1):end]..., daginds[1:N₁]...)
     return unsafe_itensormap(adjoint(t.data), newinds)
+end
+
+"""
+    transpose(t::ITensorMap)
+
+The transpose of `t`: like [`dag`](@ref) it dualizes every leg's `space` and swaps codomain
+and domain, but it does **not** conjugate the data. For real data `transpose == dag`; the two
+differ only in the complex phase, which matters when inverting a non-Hermitian (e.g. complex
+square-root) gauge factor. Implemented as a lazy TensorKit `transpose` of the data.
+"""
+function LinearAlgebra.transpose(t::ITensorMap)
+    N₁ = numout(t.data)
+    daginds = map(dag, t.inds)
+    # TensorKit `transpose` reorders legs to (domain..., codomain...) like `adjoint`, without conj
+    newinds = (daginds[(N₁ + 1):end]..., daginds[1:N₁]...)
+    return unsafe_itensormap(transpose(t.data), newinds)
 end
 
 """
