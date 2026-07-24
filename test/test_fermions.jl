@@ -371,5 +371,42 @@ end
         end
     end
 
+    @testset "(i) reverse-orientation gate (simple_update)" begin
+        # `simple_update` does not canonicalize the site order (unlike Canopy's `apply!`, which
+        # swaps so the smaller vertex is on the SVD codomain); it relies on the graded QR/SVD signs
+        # coming out right for either orientation. This checks that: evolving with each gate applied
+        # in orientation (u,w) reproduces evolving with the same physical gate built for (w,u) and
+        # applied to [ψ[w], ψ[u]]. A fermionic sign that depended on the leg order in the QR/SVD
+        # would make the two disagree. Run on a chain (tree) and a honeycomb patch (loops, where
+        # braiding signs bite); no truncation, so the evolution is exact.
+        θ = 0.4
+        for g in (named_grid((4, 1)), named_hexagonal_lattice_graph(1, 1))
+            vs, occ = cdw_occupations(g; parity_target = 0)
+            occd = Dict(vs[i] => occ[i] for i in eachindex(vs))
+            es = [(src(x), dst(x)) for x in edges(g)]
+
+            ψfwd = fermion_tensornetworkstate(v -> occd[v], g)
+            ψrev = fermion_tensornetworkstate(v -> occd[v], g)
+            sf(v) = only(TNQS.siteinds(ψfwd, v))
+            sr(v) = only(TNQS.siteinds(ψrev, v))
+
+            for (u, w) in es
+                # forward: sites (u,w), gate on (s_u, s_w)
+                upd, _, _ = TNQS.simple_update(hopping_gate(sf(u), sf(w), θ), ITensor[ψfwd[u], ψfwd[w]];
+                    envs = ITensor[], normalize_tensors = false, cutoff = 0.0, maxdim = 4096)
+                ψfwd[u] = upd[1]; ψfwd[w] = upd[2]
+                # reverse: sites (w,u), same physical gate built for (s_w, s_u)
+                upd, _, _ = TNQS.simple_update(hopping_gate(sr(w), sr(u), θ), ITensor[ψrev[w], ψrev[u]];
+                    envs = ITensor[], normalize_tensors = false, cutoff = 0.0, maxdim = 4096)
+                ψrev[w] = upd[1]; ψrev[u] = upd[2]
+            end
+
+            for v in vs
+                @test real(expect(ψfwd, ("N", v); alg = "exact")) ≈
+                    real(expect(ψrev, ("N", v); alg = "exact")) atol = 1e-10
+            end
+        end
+    end
+
 end
 end
