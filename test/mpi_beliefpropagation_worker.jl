@@ -551,6 +551,64 @@ function run_blocked_apply_case(case)
     return mpi_bpc
 end
 
+# The memory-bounded message update is the only consumer of `BeliefPropagationCacheMPI`'s `scratch`
+# field: every other cache type hands back a fresh `Ref` per call, so the reuse path -- grown once on
+# first use, shared through `copy` so that `update`'s internal copy writes to the same buffer, and
+# released at the end of the solve -- exists nowhere else and runs nowhere else.
+#
+# The messages themselves are checked the same way as `run_case`: at the fixed point, against a
+# serial reference computed with the stock "contract" update.
+function run_blocked_message_case(case)
+    g = case.g
+    ψ = global_state(g)
+    my_vertices = case.parts[RANK + 1]
+    local_ψ = local_partition(ψ, my_vertices)
+    bp_update_kwargs = (; maxiter = case.maxiter, tolerance = nothing)
+    blocked_alg = TNQS.Algorithm("blocked"; b = 1)   # b = 1 forces the maximum number of blocks
+
+    serial = update(BeliefPropagationCache(ψ); bp_update_kwargs...)
+    mpi_bpc = TNQS.BeliefPropagationCacheMPI(
+        seeded_cache(local_ψ), g, case.shared; comm = COMM
+    )
+    blocked = update(mpi_bpc; bp_update_kwargs..., message_update_alg = blocked_alg)
+
+    for e in directed_edges(local_ψ)
+        d = TNQS.message_diff(message(blocked, e), message(serial, e))
+        check(d < 1.0e-14, "blocked message $e differs from serial: diff = $d")
+    end
+    for v in my_vertices
+        a, b = TNQS.vertex_scalar(blocked, v), TNQS.vertex_scalar(serial, v)
+        check(isapprox(a, b; rtol = 1.0e-6), "blocked vertex_scalar $v: $a vs serial $b")
+    end
+
+    # `update` copies the cache and releases the scratch when it is done, and the copy shares the
+    # `Ref`, so the buffer must be back to empty here rather than squatting while gates allocate.
+    check(
+        TNQS.message_scratch(blocked) === TNQS.message_scratch(mpi_bpc),
+        "scratch Ref is shared with the cache update() copied"
+    )
+    check(isempty(TNQS.message_scratch(mpi_bpc)[]), "scratch released after update")
+
+    # A sweep grows the buffer to whatever its widest edge needs -- edges whose outgoing leg sits in
+    # the middle of the stored order ask for a factor-sized aligned copy on top of the two block
+    # buffers, so the length is not uniform across edges. Once the first sweep has been through them
+    # all, every later sweep must find that same array rather than allocate again.
+    des = directed_edges(local_ψ)
+    alg = TNQS.set_default_kwargs(blocked_alg, mpi_bpc)
+    for e in des
+        TNQS.updated_message(alg, mpi_bpc, e)
+    end
+    buf = TNQS.message_scratch(mpi_bpc)[]
+    check(!isempty(buf), "scratch grown on first use")
+    for e in des
+        TNQS.updated_message(alg, mpi_bpc, e)
+    end
+    check(TNQS.message_scratch(mpi_bpc)[] === buf, "scratch reused once grown")
+    TNQS.release_message_scratch!(mpi_bpc)
+
+    return blocked
+end
+
 const CASES = Dict(
     "path" => (run_case, path_case),
     "ring" => (run_case, ring_case),
@@ -568,7 +626,9 @@ const CASES = Dict(
     "host_staging_path" => (run_host_staging_case, path_case),
     "host_staging_ring" => (run_host_staging_case, ring_case),
     "blocked_apply_path" => (run_blocked_apply_case, apply_path_case),
-    "blocked_apply_ring" => (run_blocked_apply_case, apply_ring_case)
+    "blocked_apply_ring" => (run_blocked_apply_case, apply_ring_case),
+    "blocked_message_path" => (run_blocked_message_case, apply_path_case),
+    "blocked_message_ring" => (run_blocked_message_case, apply_ring_case)
 )
 
 # Every case named on the command line runs in this one process. Loading the package and

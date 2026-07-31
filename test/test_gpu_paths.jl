@@ -58,6 +58,23 @@ using TensorNetworkQuantumSimulator: ITensors, Algorithm, adapt, degree, norm
         @test Array(both_device) == want
     end
 
+    # Worst deviation from the "contract" path over every edge of a cache.
+    function blocked_error(cache, bs)
+        worst = 0.0f0
+        for x in TNQS.edges(cache)
+            ref, _ = TNQS.updated_message(
+                TNQS.set_default_kwargs(Algorithm("contract"), cache), cache, x
+            )
+            for b in bs
+                got, _ = TNQS.updated_message(
+                    TNQS.set_default_kwargs(Algorithm("blocked"; b), cache), cache, x
+                )
+                worst = max(worst, norm(got - ref) / norm(ref))
+            end
+        end
+        return worst
+    end
+
     @testset "blocked message update" begin
         e = first(x for x in TNQS.edges(bpc) if degree(g, TNQS.src(x)) == 3)
         ref, _ = TNQS.updated_message(TNQS.set_default_kwargs(Algorithm("contract"), bpc), bpc, e)
@@ -77,6 +94,29 @@ using TensorNetworkQuantumSimulator: ITensors, Algorithm, adapt, degree, norm
             TNQS.message_diff(TNQS.message(blocked, x), TNQS.message(plain, x))
                 for x in TNQS.edges(blocked)
         ) < 1.0f-4
+
+        # Which of the kernel's three source cases an edge takes is decided by where its outgoing
+        # leg sits in the vertex tensor's stored order: trailing reads a contiguous slice of device
+        # memory, leading gathers from a strided device view, and anything in between goes through a
+        # permuted copy. `random_tensornetworkstate` stores `(site, virtuals...)`, so the cache above
+        # covers trailing and middle; reversing every tensor's order covers leading and middle. The
+        # gather is the one that hands `permutedims!` a non-contiguous device array.
+        ψr = adapt(JLArray, random_tensornetworkstate(ComplexF32, g; bond_dimension = chi))
+        bpcr = update(BeliefPropagationCache(ψr); maxiter = 2, tolerance = nothing)
+        tnr = TNQS.network(bpcr)
+        for v in TNQS.vertices(tnr)
+            is = collect(ITensors.inds(tnr[v]))
+            TNQS.setindex_preserve!(tnr, ITensors.permute(tnr[v], reverse(is)...), v)
+        end
+        @test blocked_error(bpcr, (1, 2)) < 1.0f-4
+
+        # A degree-4 vertex: three messages to absorb, so the schedule has to permute more than once
+        # and the ping-pong between the two block buffers actually turns over.
+        g4 = named_grid((3, 3))
+        ψ4 = adapt(JLArray, random_tensornetworkstate(ComplexF32, g4; bond_dimension = 2))
+        bpc4 = update(BeliefPropagationCache(ψ4); maxiter = 2, tolerance = nothing)
+        @test any(x -> degree(g4, TNQS.src(x)) == 4, TNQS.edges(bpc4))
+        @test blocked_error(bpc4, (1, 2)) < 1.0f-4
     end
 
     # Covers qr / factorize_svd / the env gauging on a device array type.
