@@ -66,8 +66,16 @@ using ITensors.NDTensors: NDTensors
 # what makes the `adjoint` bra valid, since positions then correspond.
 #
 # So the only thing to decide is where to put `permutedims!` calls, and each one should do *all* the
-# reordering the remaining gemms need rather than one permute per gemm. That is a tiny search
-# problem, solved below once per edge on the host.
+# reordering the remaining gemms need rather than one permute per gemm. Greedily:
+#
+#   1. absorb every message whose leg already sits at an end -- free, and it cannot hurt, since a
+#      gemm leaves the layout alone;
+#   2. spend one permutation bringing the next one or two legs to the two ends;
+#   3. when one message is left, permute to the layout the close wants instead, so that the last
+#      absorption lands on it -- possible exactly when that leg is at an end of the uncut order,
+#      which is why step 2 saves such legs for last.
+#
+# For the degree-3 vertex this is one permutation per block, against three in the unscheduled version.
 
 # `kind` is `:gemm`, `:permute` or `:close`.
 #   :gemm    -- absorb message `msg` from `side` (`:front`/`:back`); `layout` is unchanged.
@@ -81,111 +89,89 @@ struct MessageOp{N}
     layout::NTuple{N, Int}
 end
 
-# The two layouts the closing gemm accepts: A's stored order of the uncut modes, with the block
-# index at either end. `:kb` is `(k…, b)` and `:bk` is `(b, k…)`; both close in a single gemm with
-# two BLAS flags, so neither is preferred and having both is what usually saves a permutation.
+# The uncut modes in A's stored order, and the two layouts the closing gemm accepts: that order with
+# the block index at either end. `:kb` is `(k…, b)` and `:bk` is `(b, k…)`; both close in a single
+# gemm with two BLAS flags, so neither is preferred -- and having both is what lets a last absorption
+# land on one of them instead of needing a permutation of its own.
 function _close_layouts(n::Int, sliced::Int)
     korder = Tuple(q for q in 1:n if q != sliced)
-    return ((:kb, (korder..., sliced)), (:bk, (sliced, korder...)))
+    return korder, (korder..., sliced), (sliced, korder...)
 end
 
-# Absorbing a message whose leg is already at an end is free and never harmful: it does not touch
-# the layout, so doing it now can only loosen the constraints on what follows.
+# A layout with `f` leading and `l` trailing (0 for "anywhere"), everything else in stored order.
+function _ends_layout(n::Int, f::Int, l::Int)
+    mid = Tuple(q for q in 1:n if q != f && q != l)
+    return ((f == 0 ? () : (f,))..., mid..., (l == 0 ? () : (l,))...)
+end
+
+# Absorbing a message whose leg is already at an end is free and never harmful: a gemm does not touch
+# the layout, so doing it now can only loosen the constraints on what follows. One pass over the two
+# ends is enough, for the same reason.
 function _free_gemms!(ops::Vector{MessageOp{N}}, layout::NTuple{N, Int}, remaining, msgof) where {N}
-    changed = true
-    while changed
-        changed = false
-        for (pos, side) in ((1, :front), (N, :back))
-            i = msgof[layout[pos]]
-            if i != 0 && remaining[i]
-                push!(ops, MessageOp(:gemm, i, side, layout, layout))
-                remaining[i] = false
-                changed = true
-            end
+    for (pos, side) in ((1, :front), (N, :back))
+        i = msgof[layout[pos]]
+        if i != 0 && remaining[i]
+            push!(ops, MessageOp(:gemm, i, side, layout, layout))
+            remaining[i] = false
         end
     end
     return ops
 end
 
-# Permutation targets worth considering: put an unabsorbed message leg (or the block index) at the
-# front and/or the back, and fill the middle in A's stored order. Filling the middle any other way
-# could never help -- the close wants exactly the stored order -- so this small set is complete for
-# our purposes while keeping the search branching tiny.
-function _candidate_layouts(layout::NTuple{N, Int}, remaining, msglegs, sliced, insrc) where {N}
-    ends = Int[sliced]
-    for (i, q) in enumerate(msglegs)
-        remaining[i] && push!(ends, q)
+# Where to permute next, given the legs still to absorb.
+#
+# One leg left at an end of the uncut order is the good case: the layout the close wants already has
+# that leg at an end, so the final gemm needs no permutation of its own. Otherwise bring the next one
+# or two legs to the ends, preferring to leave an end-of-uncut leg for last so that fusion applies.
+#
+# With nothing left to absorb this is only reached when the block still has to be gathered (a
+# strided source cannot be read as a matrix), so it gathers into a close-ready layout -- into the
+# current one if that is already close-ready, which makes the gather a plain copy.
+function _permute_target(n::Int, korder, kb, bk, layout, left::Vector{Int})
+    if isempty(left)
+        return (layout == kb || layout == bk) ? layout : kb
+    elseif length(left) == 1
+        only(left) == korder[end] && return bk
+        only(left) == korder[1] && return kb
+        return _ends_layout(n, only(left), 0)
     end
-    cands = NTuple{N, Int}[]
-    for f in (0, ends...), bk in (0, ends...)
-        f == bk != 0 && continue
-        mid = Tuple(q for q in 1:N if q != f && q != bk)
-        cand = (f == 0 ? mid : (f, mid...))
-        cand = (bk == 0 ? cand : (cand..., bk))
-        length(cand) == N || continue
-        # A permute onto the same layout is a plain copy: pointless from a buffer, but it is exactly
-        # the gather that a strided source needs.
-        (cand == layout && !insrc) && continue
-        cand in cands || push!(cands, cand)
-    end
-    return cands
-end
-
-# Depth-first over (layout, remaining) with `budget` permutations left. `insrc` says the data is
-# still the ket's slice, and `srcusable` whether that slice can feed a gemm at all -- it can only
-# when it is a contiguous run of the ket's storage, i.e. when the cut leg is trailing.
-function _schedule_search(
-        layout::NTuple{N, Int}, remaining, insrc::Bool, budget::Int,
-        msgof, msglegs, sliced::Int, srcusable::Bool, closes
-    ) where {N}
-    ops = MessageOp{N}[]
-    canread = !insrc || srcusable
-    canread && _free_gemms!(ops, layout, remaining, msgof)
-    if canread && !any(remaining)
-        for (form, target) in closes
-            if layout == target
-                push!(ops, MessageOp(:close, 0, form, layout, layout))
-                return ops
-            end
-        end
-    end
-    budget == 0 && return nothing
-    for target in _candidate_layouts(layout, remaining, msglegs, sliced, insrc)
-        sub = _schedule_search(
-            target, copy(remaining), false, budget - 1,
-            msgof, msglegs, sliced, srcusable, closes
-        )
-        isnothing(sub) && continue
-        perm = ntuple(k -> something(findfirst(==(target[k]), layout)), Val(N))
-        pushfirst!(sub, MessageOp(:permute, 0, :none, perm, target))
-        return append!(ops, sub)
-    end
-    return nothing
+    order = sort(left; by = q -> q == korder[1] || q == korder[end])
+    return _ends_layout(n, order[1], order[2])
 end
 
 """
 Schedule the ops for a ket with `n` modes whose cut leg sits at position `sliced` and whose message
-legs sit at positions `msglegs`. Pure index bookkeeping -- no tensors and no sizes are involved.
-
-Returns `nothing` if no schedule was found within `maxpermutes` permutations, which the caller turns
-into a fallback to `Algorithm("contract")`.
+legs sit at positions `msglegs`. Pure index bookkeeping -- no tensors and no sizes are involved, and
+it is cheap enough to run per edge.
 """
-function _message_schedule(n::Int, sliced::Int, msglegs::Vector{Int}; maxpermutes::Int = 3)
+function _message_schedule(n::Int, sliced::Int, msglegs::Vector{Int})
+    korder, kb, bk = _close_layouts(n, sliced)
     msgof = zeros(Int, n)
     for (i, q) in enumerate(msglegs)
         msgof[q] = i
     end
     layout = ntuple(identity, n)
-    closes = _close_layouts(n, sliced)
-    srcusable = sliced == n
-    for budget in 0:maxpermutes
-        ops = _schedule_search(
-            layout, trues(length(msglegs)), true, budget,
-            msgof, msglegs, sliced, srcusable, closes
-        )
-        isnothing(ops) || return ops
+    ops = MessageOp{n}[]
+    remaining = trues(length(msglegs))
+    # The block is a contiguous run of the ket's storage only when the cut leg is trailing. Otherwise
+    # it is strided, so nothing can be read from it as a matrix and the schedule has to open with the
+    # gather that fixes that.
+    insrc, srcusable = true, sliced == n
+
+    while true
+        canread = !insrc || srcusable
+        canread && _free_gemms!(ops, layout, remaining, msgof)
+        left = [msglegs[i] for i in eachindex(remaining) if remaining[i]]
+        if isempty(left) && canread && (layout == kb || layout == bk)
+            push!(ops, MessageOp(:close, 0, layout == kb ? :kb : :bk, layout, layout))
+            return ops
+        end
+        target = _permute_target(n, korder, kb, bk, layout, left)
+        perm = ntuple(k -> something(findfirst(==(target[k]), layout)), n)
+        push!(ops, MessageOp(:permute, 0, :none, perm, target))
+        layout, insrc = target, false
     end
-    return nothing
+    return
 end
 
 # --------------------------------------------------------------------------------------------------
@@ -364,45 +350,18 @@ end
 
 _is_dense(t::ITensor) = ITensors.storage(t) isa NDTensors.Dense && !hasqns(t)
 
-# Aligned orders worth trying. The cut leg goes last -- the close has to be able to matricize it, and
-# every block is then a contiguous run of the copy -- which leaves the two slots a gemm can consume
-# for free: the front, and the position just before the cut leg. So put one message leg in each and
-# the rest in stored order.
-function _align_candidates(n::Int, sliced::Int, msglegs::Vector{Int})
-    rest(excl) = [q for q in 1:n if q != sliced && q ∉ excl]
-    cands = Vector{Int}[]
-    if length(msglegs) >= 2
-        for a in msglegs, b in msglegs
-            a == b && continue
-            push!(cands, Int[a, rest((a, b))..., b, sliced])
-        end
-    elseif length(msglegs) == 1
-        a = only(msglegs)
-        push!(cands, Int[a, rest((a,))..., sliced])
-        push!(cands, Int[rest((a,))..., a, sliced])
-    else
-        push!(cands, Int[rest(())..., sliced])
-    end
-    return cands
-end
-
-# Unlike the stored order, the aligned order is ours to choose, so choose the one whose schedule
-# moves the least data. Which message ends up last matters: only a gemm whose leg sits at an end of
-# the uncut order can land on a layout the close accepts, so the wrong choice costs an extra
-# block-sized permutation on every block.
-function _align_schedule(n::Int, sliced::Int, msglegs::Vector{Int})
-    best, bestperm, bestops = typemax(Int), nothing, nothing
-    for perm in _align_candidates(n, sliced, msglegs)
-        legs = Int[something(findfirst(==(q), perm)) for q in msglegs]
-        ops = _message_schedule(n, n, legs)
-        isnothing(ops) && continue
-        npermutes = count(op -> op.kind === :permute, ops)
-        if npermutes < best
-            best, bestperm, bestops = npermutes, perm, ops
-        end
-        best == 0 && break
-    end
-    return bestperm, bestops
+# The order to permute into when the cut leg is neither leading nor trailing. Unlike the stored order
+# this one is ours to choose, and the choice is forced by what the schedule can then do: the cut leg
+# goes last, since the close has to be able to matricize it and every block is then a contiguous run
+# of the copy, which leaves the two slots a gemm can consume for free -- the front, and the position
+# just before the cut leg. A message leg in each is what gets a degree-3 vertex to one block
+# permutation: the first absorbs for free, and the second ends up at the end of the uncut order, so it
+# lands straight on a layout the close accepts.
+function _align_perm(n::Int, sliced::Int, msglegs::Vector{Int})
+    f = isempty(msglegs) ? 0 : first(msglegs)
+    l = length(msglegs) >= 2 ? last(msglegs) : 0
+    mid = [q for q in 1:n if q != sliced && q != f && q != l]
+    return Int[(f == 0 ? () : (f,))..., mid..., (l == 0 ? () : (l,))..., sliced]
 end
 
 function updated_message(
@@ -464,16 +423,15 @@ function updated_message(
     # needs one factor-sized permuted copy, which then plays the part of the ket throughout.
     needs_align = !(sliced == 1 || sliced == n)
     if needs_align
-        alignperm, ops = _align_schedule(n, sliced, msglegs)
-        isnothing(ops) && return fallback()
+        alignperm = _align_perm(n, sliced, msglegs)
         dims = Tuple(dim(is[alignperm[k]]) for k in 1:n)
+        msglegs = Int[something(findfirst(==(q), alignperm)) for q in msglegs]
         sliced = n
     else
         alignperm = nothing
-        ops = _message_schedule(n, sliced, msglegs)
-        isnothing(ops) && return fallback()
         dims = Tuple(dim(i) for i in is)
     end
+    ops = _message_schedule(n, sliced, msglegs)
 
     nket = prod(dims)
     nblock = div(nket, chie) * b
